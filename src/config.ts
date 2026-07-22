@@ -104,6 +104,11 @@ export default {
   notifyRedisList: process.env.NOTIFY_REDIS_LIST ?? 'jobs:meetbot:recordings',
   notifyRedisFailureList: process.env.NOTIFY_REDIS_FAILURE_LIST ?? 'jobs:meetbot:failures',
   uploaderFileExtension: normalizeFileExtension(process.env.UPLOADER_FILE_EXTENSION),
+  // Audio-only delivery: capture stays video (webm/mp4) for robustness, but the
+  // recording is transcoded to an audio-only file before upload. Downstream
+  // diarization/transcription (WhisperX) only needs audio. Default container .m4a.
+  audioOnly: process.env.AUDIO_ONLY === 'true',
+  audioOnlyExtension: normalizeFileExtension(process.env.AUDIO_ONLY_EXTENSION || '.m4a'),
   isRedisEnabled: process.env.REDIS_CONSUMER_ENABLED === 'true',
   s3CompatibleStorage: {
     endpoint: process.env.S3_ENDPOINT,

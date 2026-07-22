@@ -181,7 +181,11 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     : botType === 'microsoft'
       ? [...recordingBrowserArgs, ...fakeDeviceArgs]
       : recordingBrowserArgs;
-  const ignoreDefaultArgs = botType === 'google'
+  // '--enable-automation' sets navigator.webdriver = true and shows the
+  // "Chrome is being controlled by automated test software" infobar — Google
+  // Meet and Zoom both fingerprint for this before admission, so strip it for
+  // both; Teams hasn't shown the same sensitivity so leave it untouched there.
+  const ignoreDefaultArgs = botType !== 'microsoft'
     ? ['--mute-audio', '--enable-automation']
     : ['--mute-audio'];
 

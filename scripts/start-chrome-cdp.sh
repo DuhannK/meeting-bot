@@ -59,7 +59,7 @@ http {
 }
 EOF
 
-nginx -c /tmp/chrome-cdp-nginx.conf -g 'daemon off;' &
+/usr/sbin/nginx -c /tmp/chrome-cdp-nginx.conf -g 'daemon off;' &
 nginx_pid="$!"
 
 cleanup() {

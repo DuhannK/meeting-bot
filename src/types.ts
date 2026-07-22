@@ -109,12 +109,20 @@ export interface IVFSResponse<T> {
 export type ContentType =
   | 'video/webm'
   | 'video/mp4'
-  | 'video/x-matroska';
+  | 'video/x-matroska'
+  | 'audio/mp4'
+  | 'audio/wav'
+  | 'audio/mpeg'
+  | 'audio/ogg';
 
 export const extensionToContentType: Record<string, ContentType> = {
   '.webm': 'video/webm',
   '.mp4': 'video/mp4',
   '.mkv': 'video/x-matroska',
+  '.m4a': 'audio/mp4',
+  '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
 };
 
 export interface WaitPromise {

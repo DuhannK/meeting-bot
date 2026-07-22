@@ -518,6 +518,68 @@ class DiskUploader implements IUploader {
     }
   }
 
+  /**
+   * When AUDIO_ONLY is enabled, strip the video stream and deliver an audio-only
+   * file instead of the captured video. Downstream diarization/transcription
+   * (WhisperX) only needs audio, so this shrinks the artifact ~10x and matches
+   * the formats the analysis pipeline accepts. Covers all platforms because
+   * Google/Zoom/Teams recordings all funnel through this uploader before upload.
+   */
+  private async convertToAudioOnly(): Promise<void> {
+    if (!config.audioOnly) return;
+
+    const audioExt = config.audioOnlyExtension;
+
+    // Already in the requested audio container — nothing to strip.
+    if (this.fileExtension === audioExt) return;
+
+    const inputPath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
+    const outputPath = DiskUploader.getFilePath(this._userId, this._tempFileId, audioExt);
+
+    // .wav -> lossless PCM; otherwise compact AAC (default .m4a).
+    const codecArgs = audioExt === '.wav'
+      ? ['-c:a', 'pcm_s16le']
+      : ['-c:a', 'aac', '-b:a', '128k'];
+
+    this._logger.info('AUDIO_ONLY enabled: extracting audio-only track before upload...', {
+      inputPath,
+      outputPath,
+      userId: this._userId,
+    });
+
+    try {
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', inputPath,
+        '-vn', // drop video stream
+        ...codecArgs,
+        outputPath,
+      ], { maxBuffer: 10 * 1024 * 1024 });
+    } catch (err) {
+      this._logger.error('AUDIO_ONLY extraction failed; falling back to captured video file.', {
+        userId: this._userId,
+        error: err,
+      });
+      try {
+        await fs.promises.unlink(outputPath);
+      } catch {}
+      return; // keep original fileExtension/contentType so upload still proceeds
+    }
+
+    // Original video temp file no longer needed once audio is extracted.
+    await fs.promises.unlink(inputPath).catch(() => {});
+
+    // Deliver the audio artifact from here on (upload key, contentType, cleanup).
+    this.fileExtension = audioExt;
+    this.contentType = extensionToContentType[audioExt] ?? 'audio/mp4';
+
+    this._logger.info('AUDIO_ONLY extraction complete.', {
+      outputPath,
+      contentType: this.contentType,
+      userId: this._userId,
+    });
+  }
+
   private async ensureWebmDurationMetadata(filePath: string): Promise<void> {
     if (this.fileExtension !== '.webm') return;
 
@@ -585,9 +647,14 @@ class DiskUploader implements IUploader {
         }
       }
 
-      await this.ensureWebmDurationMetadata(filePath);
+      // Strip video for audio-only delivery (no-op unless AUDIO_ONLY=true). May
+      // change this.fileExtension, so recompute the path for the steps below.
+      await this.convertToAudioOnly();
+      const finalPath = DiskUploader.getFilePath(this._userId, this._tempFileId, this.fileExtension);
 
-      const probedDuration = await this.getMediaDuration(filePath);
+      await this.ensureWebmDurationMetadata(finalPath);
+
+      const probedDuration = await this.getMediaDuration(finalPath);
       if (typeof probedDuration === 'number') {
         this.recordingDuration = probedDuration;
       }
