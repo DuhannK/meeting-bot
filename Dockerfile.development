@@ -46,9 +46,15 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearm
 # Create symlink for Playwright compatibility (ARM64 only)
 RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then ln -sf /usr/bin/chromium /usr/bin/google-chrome; fi
 
+# Non-root user (uid 1001, matches Dockerfile.production): PulseAudio refuses to
+# start as root ("This program is not intended to be run as root"), which broke
+# Teams recording (ffmpeg's pulse audio input had no daemon to connect to).
+RUN groupadd -g 1001 nodejs && \
+    useradd -m -d /home/nodejs -r -u 1001 -g nodejs nodejs
+
 # Copy Chrome policy to allow protocol launching
 RUN mkdir -p /etc/opt/chrome/policies/managed
-COPY auto_launch_protocols.json /etc/opt/chrome/policies/managed/auto_launch_protocols.json
+COPY --chown=nodejs:nodejs auto_launch_protocols.json /etc/opt/chrome/policies/managed/auto_launch_protocols.json
 
 # Install global tools
 RUN npm install -g nodemon
@@ -68,6 +74,34 @@ RUN npm run build
 
 # Set permissions
 RUN chmod +x /usr/src/app/start.sh
+
+# X11 socket dir: created here for parity with production, but the real one at
+# runtime lives under the bind-mounted /usr/src/app tree from docker-compose,
+# so this mainly matters for non-compose `docker run` usage.
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+
+RUN mkdir -p /usr/src/app/dist/_tempvideo \
+    && chmod -R 777 /usr/src/app/dist/_tempvideo
+
+# PulseAudio needs its runtime + config dirs owned by the user that will run it
+RUN mkdir -p /run/user/1001 \
+    && chown -R nodejs:nodejs /run/user/1001 \
+    && chmod 700 /run/user/1001
+RUN mkdir -p /home/nodejs/.config/pulse \
+    && chown -R nodejs:nodejs /home/nodejs/.config
+
+# node_modules is preserved via an anonymous volume (docker-compose.yml) across
+# rebuilds; make sure the non-root user can still write into it (npm installs,
+# nodemon, etc.) instead of just read what this build produced.
+RUN chown -R nodejs:nodejs /usr/src/app/node_modules
+
+USER nodejs
+
+# Playwright's own helper binaries (e.g. the bundled ffmpeg used by recordVideo
+# in dev mode) were fetched as root above, into /root/.cache — the wrong home
+# dir now that the app runs as nodejs. Re-run as nodejs so its cache is populated
+# under /home/nodejs/.cache/ms-playwright too (matches Dockerfile.production).
+RUN npx playwright install
 
 EXPOSE 3000
 
