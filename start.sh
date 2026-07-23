@@ -36,6 +36,13 @@ for _ in {1..10}; do
     sleep 0.1
 done
 
+# A stale pid/socket left by an unclean container shutdown (e.g. Docker Desktop
+# killed mid-run) makes pulseaudio think a daemon is already running — after PID
+# reuse the stale pid can even point at an unrelated live process — and startup
+# fails with "Daemon startup failed", silently breaking Teams recording. The
+# runtime dir holds only ephemeral state, so clear it before starting fresh.
+rm -rf "$XDG_RUNTIME_DIR/pulse"
+
 # Start PulseAudio in user mode (simpler and more reliable)
 pulseaudio -D --exit-idle-time=-1 --log-level=info 2>&1
 
