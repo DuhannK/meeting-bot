@@ -213,8 +213,12 @@ async function createBrowserContext(url: string, correlationId: string, botType:
     }),
   };
 
-  if (botType === 'google' && config.googleChromeCdpUrl) {
-    console.log(`${getCorrelationIdLog(correlationId)} Connecting Google bot to external Chrome`, {
+  // Zoom's web client rejects Playwright-launched browsers outright ("Automated
+  // bots aren't allowed to join this meeting") — the same class of detection that
+  // blocked Google Meet — so Zoom shares the chrome-cdp sidecar too: a real,
+  // long-lived Chrome started without any automation flags.
+  if ((botType === 'google' || botType === 'zoom') && config.googleChromeCdpUrl) {
+    console.log(`${getCorrelationIdLog(correlationId)} Connecting ${botType} bot to external Chrome`, {
       cdpUrl: config.googleChromeCdpUrl,
     });
 
@@ -226,11 +230,17 @@ async function createBrowserContext(url: string, correlationId: string, botType:
 
     const context = browser.contexts()[0] ?? await browser.newContext({
       ...contextOptions,
-      ...(config.googleChromeStorageStatePath ? {
+      ...(botType === 'google' && config.googleChromeStorageStatePath ? {
         storageState: config.googleChromeStorageStatePath,
       } : {}),
     });
     externalBrowserContexts.add(context);
+
+    if (botType === 'zoom') {
+      // Mirrors the grant in the local-launch path below, scoped to this
+      // meeting's origin so it doesn't leak onto Google jobs sharing the context.
+      await context.grantPermissions(['microphone', 'camera'], { origin: url });
+    }
 
     const page = await context.newPage();
     await resizeBrowserWindow(page, browserWindowSize, correlationId);

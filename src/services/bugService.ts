@@ -1,6 +1,8 @@
 import config, { NODE_ENV } from '../config';
 import { Storage } from '@google-cloud/storage';
 import { Logger } from 'winston';
+import { promises as fs } from 'fs';
+import path from 'path';
 
 interface UploadOption {
   skipTimestamp?: boolean;
@@ -33,7 +35,14 @@ export const uploadDebugImage = async (
 ) => {
   try {
     if (NODE_ENV === 'development') {
-      // TODO add disk based file saving
+      // Save to the bind-mounted screenshots dir so failures can be inspected
+      // from the host. Avoid ':' in the filename — the mount is NTFS-backed.
+      const dir = path.join(process.cwd(), 'assets', 'screenshots');
+      await fs.mkdir(dir, { recursive: true });
+      const stamp = opts?.skipTimestamp ? '' : `-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+      const localFile = path.join(dir, `${fileName}${stamp}.png`);
+      await fs.writeFile(localFile, buffer);
+      logger.info(`Debug image saved locally: ${localFile}`, userId);
       return;
     }
     logger.info('Begin upload Debug Image', userId);

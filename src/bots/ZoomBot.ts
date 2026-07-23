@@ -8,7 +8,7 @@ import { patchBotStatus } from '../services/botService';
 import { RecordingTask } from '../tasks/RecordingTask';
 import { ContextBridgeTask } from '../tasks/ContextBridgeTask';
 import { getWaitingPromise } from '../lib/promise';
-import createBrowserContext from '../lib/chromium';
+import createBrowserContext, { isExternalBrowserContext } from '../lib/chromium';
 import { uploadDebugImage } from '../services/bugService';
 import { Logger } from 'winston';
 import { handleWaitingAtLobbyError } from './MeetBotBase';
@@ -33,6 +33,18 @@ class BotBase extends AbstractMeetBot {
 export class ZoomBot extends BotBase {
   constructor(logger: Logger, correlationId: string) {
     super(logger, correlationId);
+  }
+
+  // Debug screenshots must never kill the join: page.screenshot's default 30s
+  // timeout once took down a whole attempt when the renderer was busy, so cap
+  // it short and swallow failures.
+  private async captureDebugScreenshot(name: string, userId: string, botId?: string): Promise<void> {
+    try {
+      const buffer = await this.page.screenshot({ type: 'png', fullPage: true, timeout: 5000 });
+      await uploadDebugImage(buffer, name, userId, this._logger, botId);
+    } catch (err) {
+      this._logger.warn(`Debug screenshot failed (non-fatal): ${name}`, { error: (err as Error)?.message ?? err });
+    }
   }
 
   // TODO use base class for shared functions such as bot status and bot logging
@@ -74,12 +86,16 @@ export class ZoomBot extends BotBase {
       // Guarantee chrome subprocess tree is reaped regardless of exit path.
       // No-op if a deeper code path already closed the browser.
       try {
-        const browser = this.page?.context().browser();
-        if (browser?.isConnected()) {
+        const context = this.page?.context();
+        const browser = context?.browser();
+        if (isExternalBrowserContext(context)) {
+          await this.page?.close();
+          this._logger.info('External browser page closed in join finally');
+        } else if (browser?.isConnected()) {
           await browser.close();
           this._logger.info('Browser closed in join finally');
-        } else if (this.page?.context()) {
-          await this.page.context().close();
+        } else if (context) {
+          await context.close();
           this._logger.info('Persistent browser context closed in join finally');
         }
       } catch (cleanupErr) {
@@ -125,6 +141,20 @@ export class ZoomBot extends BotBase {
           return false;
         }
 
+        // Zoom's current landing page shows a "Join from browser" button right
+        // away (older UI: an <a> "Join from your browser" revealed only after
+        // clicking Download Now). Check for it first — clicking Download Now on
+        // the new UI just opens junk /download tabs in the shared browser.
+        const directJoinFromBrowser = this.page
+          .locator('a, button')
+          .filter({ hasText: /Join from (your )?browser/i })
+          .first();
+        if (await directJoinFromBrowser.isVisible({ timeout: 1000 }).catch(() => false)) {
+          this._logger.info('Join from browser button is directly visible, clicking...');
+          await directJoinFromBrowser.click({ force: true });
+          return true;
+        }
+
         const launchMeetingGetByRole = this.page.getByRole('button', { name: /Launch Meeting/i }).first();
         this._logger.info('Does Launch Meeting exist', await launchMeetingGetByRole.isVisible({ timeout: 1000 }).catch(() => false));
 
@@ -137,7 +167,7 @@ export class ZoomBot extends BotBase {
           await launchDownloadGetByRole.click({ force: true });
         }
 
-        const joinFromBrowser = this.page.locator('a', { hasText: 'Join from your browser' }).first();
+        const joinFromBrowser = this.page.locator('a, button').filter({ hasText: /Join from (your )?browser/i }).first();
         await joinFromBrowser.waitFor({ timeout: 4000 });
 
         if (await joinFromBrowser.isVisible({ timeout: 500 }).catch(() => false)) {
@@ -186,7 +216,7 @@ export class ZoomBot extends BotBase {
             }
 
             try {
-              const joinFromBrowser = this.page.locator('a', { hasText: 'Join from your browser' }).first();
+              const joinFromBrowser = this.page.locator('a, button').filter({ hasText: /Join from (your )?browser/i }).first();
               if (await joinFromBrowser.isVisible({ timeout: 500 }).catch(() => false)) {
                 this._logger.info('Waiting for zoom navigation to meeting page...', params.userId);
               }
@@ -220,25 +250,27 @@ export class ZoomBot extends BotBase {
       }
     };
 
-    // Join from browser
-    this._logger.info('Waiting for Join from your browser to be visible...');
-    const foundAndClickedJoinFromBrowser = await findAndEnableJoinFromBrowserButton(0);
-    
-    let navSuccess = false;
-    if (foundAndClickedJoinFromBrowser) {
-      this._logger.info('Verify the meeting web client is visible...');
-      // Ensure the page has navigated to the web client...
-      navSuccess = await waitForJoinFromBrowserNav();
-    }
-    
-    if (!foundAndClickedJoinFromBrowser || !navSuccess) {
-      await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'enable-join-from-browser', params.userId, this._logger, params.botId);
-      this._logger.info('Failed to enable Join from your browser button...', params.userId);
-      this._logger.info('Zoom Bot will now attempt to access the Web Client by URL...', params.userId);
-      const canAccess = await visitWebClientByUrl();
-      if (!canAccess) {
-        await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'direct-access-webclient', params.userId, this._logger, params.botId);
-        throw new Error('Unable to join meeting after trying to access the web client by /wc/join/');
+    // The direct /wc/join URL is the most deterministic route into the web
+    // client. The landing page's "Join from browser" button is unreliable under
+    // automation (its click sometimes silently never navigates), so go by URL
+    // first and keep the button dance as a fallback.
+    this._logger.info('Navigating directly to the Zoom Web Client URL...');
+    const canAccess = await visitWebClientByUrl();
+
+    if (!canAccess) {
+      this._logger.info('Direct web client access failed; falling back to the Join from browser button...', params.userId);
+      const foundAndClickedJoinFromBrowser = await findAndEnableJoinFromBrowserButton(0);
+
+      let navSuccess = false;
+      if (foundAndClickedJoinFromBrowser) {
+        this._logger.info('Verify the meeting web client is visible...');
+        // Ensure the page has navigated to the web client...
+        navSuccess = await waitForJoinFromBrowserNav();
+      }
+
+      if (!foundAndClickedJoinFromBrowser || !navSuccess) {
+        await this.captureDebugScreenshot('enable-join-from-browser', params.userId, params.botId);
+        throw new Error('Unable to join meeting after trying to access the web client by /wc/join/ and the Join from browser button');
       }
     }
 
@@ -279,7 +311,7 @@ export class ZoomBot extends BotBase {
         return true;
       } catch(err) {
         this._logger.info('Cannot detect the App container for Zoom Web Client', startWith, err);
-        await uploadDebugImage(await this.page.screenshot({ type: 'png', fullPage: true }), 'detect-app-container', params.userId, this._logger, params.botId);
+        await this.captureDebugScreenshot('detect-app-container', params.userId, params.botId);
         return await detectAppContainer(startWith === 'app' ? 'iframe' : 'app');
       }
     };
@@ -296,10 +328,51 @@ export class ZoomBot extends BotBase {
     this._logger.info('Filling the input field with the name...');
     await iframe.fill('input[type="text"]', name ? name : 'ScreenApp Notetaker');
 
+    // Zoom's newer web client covers the pre-join form with a "Do you want
+    // people to see you in the meeting?" modal, which blocks the Join button.
+    // The bot records via tab capture and never needs mic/camera, so dismiss it
+    // the same way the Google Meet bot does: continue without devices.
+    const dismissDevicePreferenceModal = async (timeout: number): Promise<boolean> => {
+      const continueWithoutDevices = iframe
+        .locator('button, a, [role="button"]')
+        .filter({ hasText: /Continue without (microphone|mic)( and camera)?/i })
+        .first();
+      try {
+        await continueWithoutDevices.waitFor({ state: 'visible', timeout });
+        this._logger.info('Device preference modal found; continuing without microphone and camera...');
+        await continueWithoutDevices.click();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (!(await dismissDevicePreferenceModal(5000))) {
+      this._logger.info('No device preference modal detected, continuing...');
+    }
+
     this._logger.info('Clicking the "Join" button...');
     const joinButton = iframe.locator('button', { hasText: 'Join' }).first();
     await joinButton.waitFor({ timeout: 15000 });
-    await joinButton.click();
+    try {
+      await joinButton.click({ timeout: 15000 });
+    } catch (firstClickErr) {
+      // The modal can also appear late (after the first dismissal window) — if
+      // something blocked the click, try dismissing it once more before failing.
+      this._logger.warn('Join click blocked; re-checking for the device preference modal...', { error: (firstClickErr as Error)?.message });
+      const dismissedLate = await dismissDevicePreferenceModal(2000);
+      try {
+        await joinButton.click({ timeout: dismissedLate ? 15000 : 5000 });
+      } catch (clickErr) {
+        // The button was visible but never became clickable — usually an overlay
+        // (bot-detection notice, captcha, permission dialog) or a disabled state.
+        // Capture what the page actually showed so the blocker is identifiable.
+        const bodyText = await iframe.evaluate(() => document.body.innerText).catch(() => '<unavailable>');
+        this._logger.error('Join click failed; page text at failure time', { bodyText });
+        await this.captureDebugScreenshot('join-click-failed', params.userId, params.botId);
+        throw clickErr;
+      }
+    }
 
     // Wait in waiting room
     try {
@@ -373,7 +446,11 @@ export class ZoomBot extends BotBase {
       this._logger.info('Bot is entering the meeting after wait room...');
     } catch (error) {
       this._logger.info('Closing the browser on error...', error);
-      await this.page.context().browser()?.close();
+      if (isExternalBrowserContext(this.page.context())) {
+        await this.page.close();
+      } else {
+        await this.page.context().browser()?.close();
+      }
 
       throw error;
     }
@@ -519,8 +596,18 @@ export class ZoomBot extends BotBase {
   
     this._logger.info('Waiting for recording duration:', config.maxRecordingDuration, 'minutes...');
     waitingPromise.promise.then(async () => {
-      this._logger.info('Closing the browser...');
-      await this.page.context().browser()?.close();
+      const context = this.page.context();
+      // For the external chrome-cdp sidecar, browser.close() only disconnects
+      // Playwright — the Zoom tab would stay open and the bot would linger in
+      // the meeting. Close the tab instead; the shared Chrome stays up for the
+      // next job.
+      if (isExternalBrowserContext(context)) {
+        this._logger.info('Closing the page (external CDP browser stays up)...');
+        await this.page.close();
+      } else {
+        this._logger.info('Closing the browser...');
+        await context.browser()?.close();
+      }
 
       this._logger.info('Recording stopped; finalizing upload next...', { botId, eventId, userId, teamId });
     });
