@@ -21,6 +21,17 @@ fi
 Xvfb "$DISPLAY" -screen 0 "${XVFB_SCREEN_SIZE}x24" -ac +extension RANDR >/tmp/xvfb.log 2>&1 &
 xvfb_pid="$!"
 
+# Under load (e.g. Docker Desktop cold-starting several containers at once),
+# Xvfb can take a moment to bind its socket. Launching Chrome before that
+# happens kills it mid-init with a misleading "Missing X server" error instead
+# of a clean retry, so wait for the actual socket rather than assuming it's
+# instant.
+x11_socket="/tmp/.X11-unix/X${DISPLAY#:}"
+for _ in $(seq 1 100); do
+  [ -S "$x11_socket" ] && break
+  sleep 0.1
+done
+
 cat >/tmp/chrome-cdp-nginx.conf <<EOF
 pid /tmp/nginx.pid;
 error_log /dev/stderr warn;
