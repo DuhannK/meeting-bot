@@ -242,6 +242,30 @@ async function createBrowserContext(url: string, correlationId: string, botType:
       await context.grantPermissions(['microphone', 'camera'], { origin: url });
     }
 
+    // Stealth for the CDP-connected browser. The playwright-extra stealth plugin
+    // only patches browsers it LAUNCHES, so it's a no-op over connectOverCDP. The
+    // containerized Chrome renders WebGL via SwiftShader ("...SwiftShader driver"),
+    // a strong software-rendering/bot tell that Zoom blocks with "Automated bots
+    // aren't allowed to join this meeting". Mask the WebGL vendor/renderer to a
+    // common real Linux Intel GPU (consistent with the Linux user agent). Applies
+    // to pages created after this call (the newPage below). Harmless for Google Meet.
+    await context.addInitScript(() => {
+      const spoof: Record<number, string> = {
+        37445: 'Google Inc. (Intel)', // UNMASKED_VENDOR_WEBGL
+        37446: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL 4.6)', // UNMASKED_RENDERER_WEBGL
+      };
+      const patch = (proto: { getParameter?: (p: number) => unknown } | undefined) => {
+        if (!proto || !proto.getParameter) return;
+        const original = proto.getParameter;
+        proto.getParameter = function (parameter: number) {
+          const spoofed = spoof[parameter];
+          return spoofed !== undefined ? spoofed : original.call(this, parameter);
+        };
+      };
+      patch((window as unknown as { WebGLRenderingContext?: { prototype: { getParameter?: (p: number) => unknown } } }).WebGLRenderingContext?.prototype);
+      patch((window as unknown as { WebGL2RenderingContext?: { prototype: { getParameter?: (p: number) => unknown } } }).WebGL2RenderingContext?.prototype);
+    });
+
     const page = await context.newPage();
     await resizeBrowserWindow(page, browserWindowSize, correlationId);
     await page.setViewportSize(size);

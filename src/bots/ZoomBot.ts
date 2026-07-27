@@ -354,24 +354,61 @@ export class ZoomBot extends BotBase {
     this._logger.info('Clicking the "Join" button...');
     const joinButton = iframe.locator('button', { hasText: 'Join' }).first();
     await joinButton.waitFor({ timeout: 15000 });
-    try {
-      await joinButton.click({ timeout: 15000 });
-    } catch (firstClickErr) {
-      // The modal can also appear late (after the first dismissal window) — if
-      // something blocked the click, try dismissing it once more before failing.
-      this._logger.warn('Join click blocked; re-checking for the device preference modal...', { error: (firstClickErr as Error)?.message });
-      const dismissedLate = await dismissDevicePreferenceModal(2000);
+
+    // Zoom's web client leaves a ReactModal overlay (`.ReactModal__Overlay--after-open`)
+    // on top of the pre-join form. Even after dismissing the device-preference
+    // modal, that overlay can linger and intercept pointer events, so a normal
+    // Playwright click on Join times out (every coordinate click lands on the
+    // overlay, not the button — observed as 30+ blocked retries). Fix: dismiss any
+    // (re-appearing) modal, wait briefly for the overlay to detach, try a normal
+    // click, and fall back to a direct in-page `element.click()` that bypasses
+    // coordinate hit-testing entirely — an overlay cannot block that.
+    let joinClicked = false;
+    for (let attempt = 1; attempt <= 4 && !joinClicked; attempt++) {
+      // The modal can re-appear after the first dismissal window; keep clearing it.
+      await dismissDevicePreferenceModal(1500);
+
+      // Give any ReactModal overlay a moment to detach so it stops intercepting.
+      await iframe
+        .locator('.ReactModal__Overlay')
+        .first()
+        .waitFor({ state: 'detached', timeout: 2000 })
+        .catch(() => {});
+
       try {
-        await joinButton.click({ timeout: dismissedLate ? 15000 : 5000 });
+        await joinButton.click({ timeout: 4000 });
+        joinClicked = true;
+        this._logger.info(`Join clicked on attempt ${attempt}.`);
+        break;
       } catch (clickErr) {
-        // The button was visible but never became clickable — usually an overlay
-        // (bot-detection notice, captcha, permission dialog) or a disabled state.
-        // Capture what the page actually showed so the blocker is identifiable.
-        const bodyText = await iframe.evaluate(() => document.body.innerText).catch(() => '<unavailable>');
-        this._logger.error('Join click failed; page text at failure time', { bodyText });
-        await this.captureDebugScreenshot('join-click-failed', params.userId, params.botId);
-        throw clickErr;
+        this._logger.warn(
+          `Join click attempt ${attempt} blocked by an overlay; trying a direct JS click...`,
+          { error: (clickErr as Error)?.message }
+        );
+        // Dispatch click directly on the element — React's delegated click handler
+        // still fires, and no overlay can intercept an in-page element.click().
+        const jsClicked = await joinButton
+          .evaluate((el) => {
+            (el as HTMLElement).click();
+            return true;
+          })
+          .catch(() => false);
+        if (jsClicked) {
+          joinClicked = true;
+          this._logger.info(`Join clicked via JS on attempt ${attempt} (overlay bypassed).`);
+          break;
+        }
       }
+
+      await this.page.waitForTimeout(500);
+    }
+
+    if (!joinClicked) {
+      // Genuinely stuck — capture what the page showed so the blocker is identifiable.
+      const bodyText = await iframe.evaluate(() => document.body.innerText).catch(() => '<unavailable>');
+      this._logger.error('Join click failed after robust attempts; page text at failure time', { bodyText });
+      await this.captureDebugScreenshot('join-click-failed', params.userId, params.botId);
+      throw new Error('Zoom Join button could not be clicked — an overlay kept intercepting pointer events');
     }
 
     // Wait in waiting room

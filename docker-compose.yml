@@ -1,10 +1,25 @@
+# ── Çalışma modeli (worker-per-meeting) ─────────────────────────────────────
+# Bu compose artık yalnızca STANDING ALTYAPIYI ayağa kaldırır: redis + minio +
+# createbuckets. Kayıt botunun kendisi ARTIK burada uzun ömürlü çalışmaz; ana
+# proje (beetinq) her (çakışan) toplantı için `meeting-bot:worker` imajından
+# Docker ile bir EPHEMERAL worker konteyneri başlatır, iş bitince `--rm` siler.
+# Eş zamanlılık = aynı anda çalışan worker sayısı; eş zamanlı Teams konteyner
+# izolasyonuyla (her worker kendi ekranı + ses sink'i) sorunsuz çalışır.
+#
+# Kullanım:
+#   docker compose up -d                       # altyapı (redis, minio)
+#   docker compose --profile build build       # meeting-bot:worker imajını üret
+#   (workers'ı backend başlatır — buradan elle up etmeye gerek yok)
+#
+# Eski tek-konteyner "classic" mod hâlâ mevcut (test/geri dönüş için):
+#   docker compose --profile classic up --build
 services:
   redis:
     image: redis:7-alpine
     # Host-published port is configurable via REDIS_PORT_HOST (default 6379) so it
     # can dodge another local Redis already using :6379:
     #   REDIS_PORT_HOST=6380 docker compose up
-    # The bot itself always reaches Redis over the compose network as `redis:6379`.
+    # Workers reach Redis over host.docker.internal:${REDIS_PORT_HOST} (event bus).
     ports:
       - "${REDIS_PORT_HOST:-6379}:6379"
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -16,27 +31,64 @@ services:
     volumes:
       - cache:/data
 
+  # Local S3-compatible object storage. Worker konteynerleri audio-only kaydı
+  # buraya yükler; downstream analiz projesi (WhisperX) aynı bucket'tan çeker.
+  minio:
+    image: minio/minio:latest
+    platform: linux/amd64
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_PORT_HOST:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT_HOST:-9001}:9001"
+    volumes:
+      - minio_data:/data
+
+  # One-shot: wait for MinIO, then ensure the recordings bucket exists. Exits 0.
+  createbuckets:
+    image: minio/mc:latest
+    platform: linux/amd64
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-meeting-recordings}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do echo 'waiting for minio...'; sleep 2; done;
+      mc mb -p local/$${S3_BUCKET_NAME};
+      echo 'bucket ready:' $${S3_BUCKET_NAME};
+      exit 0;
+      "
+
+  # ── Worker imajını BUILD etmek için (çalıştırmaz) ─────────────────────────
+  # `docker compose --profile build build` bu imajı üretir; backend
+  # `docker run meeting-bot:worker` ile toplantı başına başlatır.
+  meeting-bot-worker:
+    profiles: ["build"]
+    image: meeting-bot:worker
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: ["true"] # asla standing çalışmaz; yalnızca imaj build hedefi
+
+  # ── (classic) Eski tek-konteyner mod — varsayılan başlamaz ────────────────
+  # Geri dönüş / izole test için. `--profile classic up` ile çalışır.
   meeting-bot:
+    profiles: ["classic"]
     platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile.development
-    # App config (storage provider, uploader, Azure/S3 creds, notifications, etc.)
-    # is the source of truth in .env — copy .env.example -> .env. Only the values
-    # that must differ inside the compose network are overridden in `environment`.
     env_file:
       - .env
     environment:
       - NODE_ENV=development
-      # Defaults to the bundled redis service over the compose network (.env's
-      # host.docker.internal is wrong for the in-compose redis). Override to attach
-      # the bot to another Redis — e.g. a local backend's queue so UI-triggered
-      # jobs reach it: REDIS_HOST=host.docker.internal docker compose up
       - REDIS_HOST=${REDIS_HOST:-redis}
-      # Default to the bundled chrome-cdp sidecar so Google Meet joins use a real,
-      # signed-in-capable Chrome instead of the bot's in-container Chromium (which
-      # Google increasingly blocks). Set GOOGLE_CHROME_CDP_URL= (empty) to fall
-      # back to the in-container browser. See README.md (Usage → Join a Google Meet).
       - GOOGLE_CHROME_CDP_URL=${GOOGLE_CHROME_CDP_URL-http://chrome-cdp:9223}
     ports:
       - "3000:3000"
@@ -55,13 +107,9 @@ services:
       createbuckets:
         condition: service_completed_successfully
 
-  # Real Google Chrome + Xvfb exposed over the Chrome DevTools Protocol, used by
-  # the Google Meet bot via GOOGLE_CHROME_CDP_URL. Port 9223 is an nginx proxy
-  # that rewrites the Host header so Playwright can drive Chrome's DevTools
-  # endpoint from another container (Chrome's raw 9222 is loopback-only and
-  # rejects cross-container Host headers). Kept on the internal compose network
-  # only — never publish the CDP port to the host. See README.md (Usage → Join a Google Meet).
+  # (classic) Real Google Chrome + Xvfb over CDP — only used by the classic mode.
   chrome-cdp:
+    profiles: ["classic"]
     platform: linux/amd64
     build:
       context: .
@@ -74,40 +122,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-  # Local S3-compatible object storage. meeting-bot uploads the audio-only
-  # recording here; the downstream analysis project (WhisperX) pulls it from the
-  # same bucket over the internal compose network. Console UI on :9001.
-  minio:
-    image: minio/minio:latest
-    platform: linux/amd64
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-    ports:
-      - "${MINIO_PORT_HOST:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT_HOST:-9001}:9001"
-    volumes:
-      - minio_data:/data
-
-  # One-shot: wait for MinIO, then ensure the recordings bucket exists. Exits 0.
-  # meeting-bot waits for this to complete before starting.
-  createbuckets:
-    image: minio/mc:latest
-    platform: linux/amd64
-    depends_on:
-      - minio
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-meeting-recordings}
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}; do echo 'waiting for minio...'; sleep 2; done;
-      mc mb -p local/$${S3_BUCKET_NAME};
-      echo 'bucket ready:' $${S3_BUCKET_NAME};
-      exit 0;
-      "
 
 
 volumes:

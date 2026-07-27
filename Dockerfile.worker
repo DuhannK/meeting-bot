@@ -1,0 +1,119 @@
+# Ephemeral "one meeting per container" worker image.
+#
+# Merges the meeting-bot app (Dockerfile.production) with the real-Chrome + CDP
+# sidecar (Dockerfile.chrome-cdp) into a single self-sufficient image, so one
+# `docker run` per meeting is a complete recording unit:
+#   - Google/Zoom → real Google Chrome driven over CDP (localhost:9223), on :98
+#   - Microsoft Teams → in-container Playwright browser + ffmpeg x11grab, on :99
+# The backend spawns one of these per meeting (see beetinq BotOrchestratorService);
+# concurrency = number of containers, and concurrent Teams works via isolation.
+FROM node:20
+
+WORKDIR /usr/src/app
+
+# System dependencies. Same set as Dockerfile.production PLUS nginx (the CDP proxy
+# used by scripts/start-chrome-cdp.sh) and curl (readiness probe in start-worker.sh).
+RUN apt-get update && \
+  apt-get install -y \
+  ffmpeg \
+  libnss3 \
+  libxss1 \
+  libasound2 \
+  pulseaudio \
+  alsa-utils \
+  libatk1.0-0 \
+  libatk-bridge2.0-0 \
+  libcups2 \
+  libxkbcommon-x11-0 \
+  libgbm-dev \
+  libgl1-mesa-dri \
+  libgl1-mesa-glx \
+  mesa-utils \
+  xvfb \
+  wget \
+  gnupg \
+  curl \
+  nginx \
+  xorg \
+  xserver-xorg \
+  libx11-dev \
+  libxext-dev \
+  dos2unix \
+  # ARM-specific packages (only for ARM64)
+  $(if [ "$(dpkg --print-architecture)" = "arm64" ]; then echo "libgles2 libegl1 libwayland-egl1"; fi) \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Google Chrome (real Chrome — needed to evade Google/Zoom bot detection)
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-key.gpg && \
+  ARCH=$(dpkg --print-architecture) && \
+  if [ "$ARCH" = "amd64" ]; then \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-key.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list; \
+  elif [ "$ARCH" = "arm64" ]; then \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/google-linux-signing-key.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list; \
+  else \
+    echo "deb [signed-by=/usr/share/keyrings/google-linux-signing-key.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list; \
+  fi && \
+  apt-get update && apt-get install -y google-chrome-stable || apt-get install -y chromium && \
+  rm -rf /var/lib/apt/lists/*
+
+# Create symlink for Playwright compatibility (ARM64 only)
+RUN if [ "$(dpkg --print-architecture)" = "arm64" ]; then ln -sf /usr/bin/chromium /usr/bin/google-chrome; fi
+
+# Non-root user (uid 1001): PulseAudio refuses to run as root, which breaks Teams
+# recording. Mirrors Dockerfile.production.
+RUN groupadd -g 1001 nodejs && \
+    useradd -m -d /home/nodejs -r -u 1001 -g nodejs nodejs
+
+# Copy Chrome policy to allow protocol launching
+RUN mkdir -p /etc/opt/chrome/policies/managed
+COPY --chown=nodejs:nodejs auto_launch_protocols.json /etc/opt/chrome/policies/managed/auto_launch_protocols.json
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci && npm cache clean --force
+
+# Install Playwright and its dependencies
+RUN npx playwright install --with-deps
+
+# Copy source code
+COPY . .
+
+ENV NODE_ENV=production
+
+# Startup scripts must be executable + LF line endings (repo may be checked out on Windows)
+RUN dos2unix /usr/src/app/start-worker.sh /usr/src/app/scripts/start-chrome-cdp.sh /usr/src/app/xvfb-run-wrapper && \
+    chmod +x /usr/src/app/start-worker.sh /usr/src/app/scripts/start-chrome-cdp.sh /usr/src/app/xvfb-run-wrapper
+
+# Build the TypeScript code (produces dist/runOnce.js)
+RUN npm run build
+
+USER root
+RUN mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
+RUN mkdir -p /usr/src/app/dist/_tempvideo && chmod -R 777 /usr/src/app/dist/_tempvideo
+# PulseAudio runtime + config dirs owned by the non-root user
+RUN mkdir -p /run/user/1001 && chown -R nodejs:nodejs /run/user/1001 && chmod 700 /run/user/1001
+RUN mkdir -p /home/nodejs/.config/pulse && chown -R nodejs:nodejs /home/nodejs/.config
+# Chrome CDP profile dir (per-container, so no cross-worker collisions)
+RUN mkdir -p /tmp/chrome-profile && chown -R nodejs:nodejs /tmp/chrome-profile
+
+USER nodejs
+
+# Re-install Playwright as nodejs so its cache lands under /home/nodejs/.cache too
+RUN npx playwright install
+
+# ── Bot-internal defaults baked in so the backend only passes per-meeting +
+#    MinIO/Redis connection values. Audio-only delivery to MinIO + Redis event,
+#    real Chrome over CDP for Google/Zoom, no long-lived queue consumer. ──
+ENV AUDIO_ONLY=true \
+    UPLOADER_TYPE=s3 \
+    STORAGE_PROVIDER=s3 \
+    S3_USE_MINIO_COMPATIBILITY=true \
+    NOTIFY_REDIS_ENABLED=true \
+    NOTIFY_REDIS_LIST=jobs:meetbot:recordings \
+    NOTIFY_REDIS_FAILURE_LIST=jobs:meetbot:failures \
+    NOTIFY_REDIS_DB=1 \
+    REDIS_CONSUMER_ENABLED=false \
+    GOOGLE_CHROME_CDP_URL=http://localhost:9223
+
+# No EXPOSE / HEALTHCHECK: the worker serves no HTTP — it runs one meeting and exits.
+CMD ["/bin/bash", "/usr/src/app/start-worker.sh"]

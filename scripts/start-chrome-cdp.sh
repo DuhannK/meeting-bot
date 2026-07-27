@@ -99,6 +99,11 @@ google-chrome-stable \
   --disable-backgrounding-occluded-windows \
   --disable-renderer-backgrounding \
   --no-sandbox \
+  --use-gl=angle \
+  --use-angle=swiftshader \
+  --enable-unsafe-swiftshader \
+  --ignore-gpu-blocklist \
+  --enable-webgl \
   "$CHROME_URL" &
 chrome_pid="$!"
 

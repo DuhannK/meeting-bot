@@ -2,13 +2,7 @@ import { globalJobStore } from '../lib/globalJobStore';
 import { MeetingJoinRedisParams, notifyMeetingJoinFailure } from '../app/common';
 import messageBroker from './messageBroker';
 import { loggerFactory, createCorrelationId } from '../util/logger';
-import { GoogleMeetBot } from '../bots/GoogleMeetBot';
-import DiskUploader, { IUploader } from '../middleware/disk-uploader';
-import { getRecordingNamePrefix } from '../util/recordingName';
-import { encodeFileNameSafebase64 } from '../util/strings';
-import { JoinParams } from '../bots/AbstractMeetBot';
-import { MicrosoftTeamsBot } from '../bots/MicrosoftTeamsBot';
-import { ZoomBot } from '../bots/ZoomBot';
+import { runMeetingJob } from '../lib/runMeetingJob';
 import config from '../config';
 
 export class RedisConsumerService {
@@ -138,57 +132,7 @@ export class RedisConsumerService {
       });
 
       const jobAcceptedResult = await globalJobStore.addJob(async () => {
-        // Initialize disk uploader
-        const entityId = meetingParams.botId ?? meetingParams.eventId;
-        const tempId = `${meetingParams.userId}${entityId}0`; // Using 0 as retry count
-        const tempFileId = encodeFileNameSafebase64(tempId);
-        const namePrefix = getRecordingNamePrefix(meetingParams.provider);
-
-        const uploader: IUploader = await DiskUploader.initialize(
-          meetingParams.bearerToken,
-          meetingParams.teamId,
-          meetingParams.timezone,
-          meetingParams.userId,
-          meetingParams.botId ?? '',
-          namePrefix,
-          tempFileId,
-          logger,
-          meetingParams.url,
-        );
-
-        // Create and join the meeting
-        const joinParams: JoinParams = {
-          url: meetingParams.url,
-          name: meetingParams.name,
-          bearerToken: meetingParams.bearerToken,
-          teamId: meetingParams.teamId,
-          timezone: meetingParams.timezone,
-          userId: meetingParams.userId,
-          eventId: meetingParams.eventId,
-          botId: meetingParams.botId,
-          uploader
-        };
-
-        switch (meetingParams.provider) {
-          case 'google':
-            const googleBot = new GoogleMeetBot(logger, correlationId);
-            await googleBot.join(joinParams);
-            logger.info('Google Meet recording job completed successfully (join, record, upload).', meetingParams.userId, meetingParams.teamId);
-            break;
-          case 'microsoft':
-            const microsoftBot = new MicrosoftTeamsBot(logger, correlationId);
-            await microsoftBot.join(joinParams);
-            logger.info('Microsoft Teams recording job completed successfully (join, record, upload).', meetingParams.userId, meetingParams.teamId);
-            break;
-          case 'zoom':
-            const zoomBot = new ZoomBot(logger, correlationId);
-            await zoomBot.join(joinParams);
-            logger.info('Zoom recording job completed successfully (join, record, upload).', meetingParams.userId, meetingParams.teamId);
-            break;
-          default:
-            throw new Error(`Unsupported provider: ${meetingParams.provider}`);
-        }
-
+        await runMeetingJob(meetingParams, logger, correlationId);
       }, logger, 0, async (error) => {
         await notifyMeetingJoinFailure(meetingParams, error, logger);
         await messageBroker.acknowledgeProcessingMeetingbotJob(message);
